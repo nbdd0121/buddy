@@ -314,7 +314,7 @@ const _: () = assert!((1 << MIN_BLOCK) >= mem::size_of::<FreeBlockNode>());
 
 #[repr(C)]
 struct BuddyGroups<'a> {
-    groups: Option<&'a mut [BuddyGroup<'a>; MAX_BLOCK - MIN_BLOCK]>,
+    groups: &'a mut [BuddyGroup<'a>; MAX_BLOCK - MIN_BLOCK],
     catch_all: FreeBlockList,
 }
 
@@ -322,7 +322,7 @@ impl Debug for BuddyGroups<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_map();
         for i in MIN_BLOCK..MAX_BLOCK {
-            debug.entry(&i, &self.groups.as_ref().unwrap()[i - MIN_BLOCK]);
+            debug.entry(&i, &self.groups[i - MIN_BLOCK]);
         }
         debug.entry(&MAX_BLOCK, &self.catch_all).finish()
     }
@@ -354,13 +354,13 @@ impl BuddyGroups<'_> {
         }
 
         let size = size.max(Size::from_log2(MIN_BLOCK));
-        let group = self.groups.as_mut()?.get_mut(size.in_log2() - MIN_BLOCK)?;
+        let group = self.groups.get_mut(size.in_log2() - MIN_BLOCK)?;
         match group.allocate(size) {
             Some(v) => Some(v),
             None => {
                 let ptr = self.allocate(size.parent())?;
                 unsafe {
-                    self.groups.as_mut()?[size.in_log2() - MIN_BLOCK]
+                    self.groups[size.in_log2() - MIN_BLOCK]
                         .deallocate(size, size.buddy_block(ptr))
                         .map(|_| unreachable!());
                 };
@@ -375,7 +375,7 @@ impl BuddyGroups<'_> {
         }
 
         let size = size.max(Size::from_log2(MIN_BLOCK));
-        match self.groups.as_mut().unwrap()[size.in_log2() - MIN_BLOCK].deallocate(size, ptr) {
+        match self.groups[size.in_log2() - MIN_BLOCK].deallocate(size, ptr) {
             None => (),
             Some(v) => {
                 self.deallocate(size.parent(), v);
@@ -400,9 +400,7 @@ impl BuddyGroups<'_> {
 
         let mut test_size = size;
         while test_size < new_size {
-            if self.groups.as_mut().unwrap()[test_size.in_log2() - MIN_BLOCK]
-                .is_buddy_allocated(test_size, block)
-            {
+            if self.groups[test_size.in_log2() - MIN_BLOCK].is_buddy_allocated(test_size, block) {
                 return false;
             }
             test_size = test_size.parent()
@@ -416,8 +414,7 @@ impl BuddyGroups<'_> {
         debug_assert!(self.can_grow(size, new_size, block));
 
         while size < new_size {
-            let v =
-                self.groups.as_mut().unwrap()[size.in_log2() - MIN_BLOCK].deallocate(size, block);
+            let v = self.groups[size.in_log2() - MIN_BLOCK].deallocate(size, block);
             assert_eq!(v, Some(block));
             size = size.parent();
         }
@@ -463,7 +460,7 @@ impl BuddyGroups<'_> {
 
         let groups = unsafe { mem::transmute(groups) };
         let mut alloc = BuddyGroups {
-            groups: Some(groups),
+            groups,
             catch_all: FreeBlockList { head: None },
         };
 
@@ -476,42 +473,21 @@ impl BuddyGroups<'_> {
 
         Some(alloc)
     }
-
-    const fn empty() -> Self {
-        #[repr(C)]
-        struct Dummy {
-            groups: Option<&'static [BuddyGroup<'static>; MAX_BLOCK - MIN_BLOCK]>,
-            catch_all: FreeBlockList,
-        }
-        unsafe {
-            mem::transmute(Dummy {
-                groups: None,
-                catch_all: FreeBlockList { head: None },
-            })
-        }
-    }
 }
 
 pub struct BuddyAllocator<'a>(spin::Mutex<BuddyGroups<'a>>);
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum InitError {
-    AlreadyInitialized,
     MemoryTooSmall,
 }
 
 impl<'a> BuddyAllocator<'a> {
-    pub const fn new() -> Self {
-        Self(spin::Mutex::new(BuddyGroups::empty()))
-    }
-
-    pub fn initialize(&self, memory: &'a mut [u8]) -> Result<(), InitError> {
-        let mut guard = self.0.lock();
-        if !guard.groups.is_none() {
-            return Err(InitError::AlreadyInitialized);
-        }
-        *guard = BuddyGroups::new(memory).ok_or(InitError::MemoryTooSmall)?;
-        Ok(())
+    pub fn new(memory: &'a mut [u8]) -> Result<Self, InitError> {
+        Ok(BuddyAllocator(spin::Mutex::new(
+            BuddyGroups::new(memory).ok_or(InitError::MemoryTooSmall)?,
+        )))
     }
 }
 
