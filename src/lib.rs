@@ -390,8 +390,8 @@ impl BuddyGroups<'_> {
         }
     }
 
-    // Try to grow `block` in place.
-    unsafe fn grow(&mut self, mut size: Size, new_size: Size, block: NonNull<()>) -> bool {
+    // Check if `block` can grow in place.
+    unsafe fn can_grow(&mut self, size: Size, new_size: Size, block: NonNull<()>) -> bool {
         // Check for alignment, if unaligned then this is definitely not possible
         let aligned_ptr = block.as_ptr() as usize >> new_size.in_log2() << new_size.in_log2();
         if block.as_ptr() as usize != aligned_ptr {
@@ -408,14 +408,19 @@ impl BuddyGroups<'_> {
             test_size = test_size.parent()
         }
 
+        true
+    }
+
+    // Commit the block growth.
+    unsafe fn grow(&mut self, mut size: Size, new_size: Size, block: NonNull<()>) {
+        debug_assert!(self.can_grow(size, new_size, block));
+
         while size < new_size {
             let v =
                 self.groups.as_mut().unwrap()[size.in_log2() - MIN_BLOCK].deallocate(size, block);
             assert_eq!(v, Some(block));
             size = size.parent();
         }
-
-        true
     }
 
     fn new(memory: &mut [u8]) -> Option<Self> {
@@ -543,7 +548,8 @@ unsafe impl core::alloc::GlobalAlloc for BuddyAllocator<'_> {
             ptr
         } else {
             let mut guard = self.0.lock();
-            if guard.grow(size, new_size, NonNull::new_unchecked(ptr as *mut _)) {
+            if guard.can_grow(size, new_size, NonNull::new_unchecked(ptr as *mut _)) {
+                guard.grow(size, new_size, NonNull::new_unchecked(ptr as *mut _));
                 ptr
             } else {
                 let new_ptr = match guard.allocate(new_size) {
