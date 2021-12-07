@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 spin = { version = "0.9", default-features = false, features = ["mutex", "spin_mutex"] }
+
+[dev-dependencies]
+libc = "0.2"
+once_cell = "1.8"
