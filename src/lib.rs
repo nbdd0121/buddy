@@ -252,69 +252,14 @@ impl Debug for FreeBlockList {
     }
 }
 
-struct BuddyGroup<'a> {
-    free_blocks: FreeBlockList,
-    bitmap: &'a mut Bitmap,
-    base: usize,
-}
-
-impl Debug for BuddyGroup<'_> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BuddyGroup")
-            .field("free_blocks", &self.free_blocks)
-            .field("base", &self.base)
-            .finish()
-    }
-}
-
-impl BuddyGroup<'_> {
-    fn allocate(&mut self, size: Size) -> Option<NonNull<()>> {
-        let block = self.free_blocks.pop_block()?;
-
-        // Flip the bit in the bitmap.
-        // Note that bitmap records a single bit for two consecutive blocks.
-        let bitmap_index =
-            (block.as_ptr() as usize).checked_sub(self.base).unwrap() >> size.parent().in_log2();
-        self.bitmap.flip(bitmap_index);
-
-        Some(block)
-    }
-
-    unsafe fn deallocate(&mut self, size: Size, block: NonNull<()>) -> Option<NonNull<()>> {
-        // Flip the bit in the bitmap.
-        let bitmap_index =
-            (block.as_ptr() as usize).checked_sub(self.base).unwrap() >> size.parent().in_log2();
-
-        // If the bit is original set, then one of the blocks are free.
-        // Since we know that the current one is not free, so the other one must be free.
-        if self.bitmap.flip(bitmap_index) {
-            self.free_blocks.remove_block(size.buddy_block(block));
-            return Some(size.parent_block(block));
-        }
-
-        self.free_blocks.push_block(block);
-        None
-    }
-
-    // Try to find if buddy is allocated for an already-allocated `block`.
-    unsafe fn is_buddy_allocated(&mut self, size: Size, block: NonNull<()>) -> bool {
-        // Flip the bit in the bitmap.
-        let bitmap_index =
-            (block.as_ptr() as usize).checked_sub(self.base).unwrap() >> size.parent().in_log2();
-
-        // If the bit is set, then one of the blocks are free.
-        // Since we know that the current one is not free, so the other one must be free.
-        !self.bitmap.test(bitmap_index)
-    }
-}
-
 const MIN_BLOCK: usize = 4; // 16B
 const MAX_BLOCK: usize = 30; // 1GiB
 const _: () = assert!((1 << MIN_BLOCK) >= mem::size_of::<FreeBlockNode>());
 
 #[repr(C)]
 struct BuddyGroups<'a> {
-    groups: &'a mut [BuddyGroup<'a>; MAX_BLOCK - MIN_BLOCK],
+    free_blocks: [FreeBlockList; MAX_BLOCK - MIN_BLOCK],
+    metadata: [(&'a mut Bitmap, usize); MAX_BLOCK - MIN_BLOCK],
     catch_all: FreeBlockList,
 }
 
@@ -322,13 +267,63 @@ impl Debug for BuddyGroups<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_map();
         for i in MIN_BLOCK..MAX_BLOCK {
-            debug.entry(&i, &self.groups[i - MIN_BLOCK]);
+            debug.entry(&i, &self.free_blocks[i - MIN_BLOCK]);
         }
         debug.entry(&MAX_BLOCK, &self.catch_all).finish()
     }
 }
 
 impl BuddyGroups<'_> {
+    // Test if a bit is set.
+    fn metadata_test(&self, size: Size, ptr: usize) -> bool {
+        debug_assert!((MIN_BLOCK..MAX_BLOCK).contains(&size.in_log2()));
+
+        let (ref bitmap, base) = self.metadata[size.in_log2() - MIN_BLOCK];
+        let bitmap_index = ptr.checked_sub(base).unwrap() >> size.parent().in_log2();
+        bitmap.test(bitmap_index)
+    }
+
+    // Flip a bit and return the original.
+    fn metadata_flip(&mut self, size: Size, offset: usize) -> bool {
+        debug_assert!((MIN_BLOCK..MAX_BLOCK).contains(&size.in_log2()));
+
+        let (ref mut bitmap, base) = self.metadata[size.in_log2() - MIN_BLOCK];
+        let bitmap_index = offset.checked_sub(base).unwrap() >> size.parent().in_log2();
+        bitmap.flip(bitmap_index)
+    }
+
+    fn allocate_exact(&mut self, size: Size) -> Option<NonNull<()>> {
+        debug_assert!((MIN_BLOCK..MAX_BLOCK).contains(&size.in_log2()));
+
+        let block = self.free_blocks[size.in_log2() - MIN_BLOCK].pop_block()?;
+        self.metadata_flip(size, block.as_ptr() as usize);
+
+        Some(block)
+    }
+
+    unsafe fn deallocate_exact(&mut self, size: Size, block: NonNull<()>) -> Option<NonNull<()>> {
+        debug_assert!((MIN_BLOCK..MAX_BLOCK).contains(&size.in_log2()));
+
+        // If the bit is original set, then one of the blocks are free.
+        // Since we know that the current one is not free, so the other one must be free.
+        if self.metadata_flip(size, block.as_ptr() as usize) {
+            self.free_blocks[size.in_log2() - MIN_BLOCK].remove_block(size.buddy_block(block));
+            return Some(size.parent_block(block));
+        }
+
+        self.free_blocks[size.in_log2() - MIN_BLOCK].push_block(block);
+        None
+    }
+
+    // Try to find if buddy is allocated for an already-allocated `block`.
+    unsafe fn is_buddy_allocated(&mut self, size: Size, block: NonNull<()>) -> bool {
+        debug_assert!((MIN_BLOCK..MAX_BLOCK).contains(&size.in_log2()));
+
+        // If the bit is set, then one of the blocks are free.
+        // Since we know that the current one is not free, so the other one must be free.
+        !self.metadata_test(size, block.as_ptr() as usize)
+    }
+
     #[cold]
     fn allocate_max(&mut self, size: Size) -> Option<NonNull<()>> {
         // Too large to allocate
@@ -354,14 +349,12 @@ impl BuddyGroups<'_> {
         }
 
         let size = size.max(Size::from_log2(MIN_BLOCK));
-        let group = self.groups.get_mut(size.in_log2() - MIN_BLOCK)?;
-        match group.allocate(size) {
+        match self.allocate_exact(size) {
             Some(v) => Some(v),
             None => {
                 let ptr = self.allocate(size.parent())?;
                 unsafe {
-                    self.groups[size.in_log2() - MIN_BLOCK]
-                        .deallocate(size, size.buddy_block(ptr))
+                    self.deallocate_exact(size, size.buddy_block(ptr))
                         .map(|_| unreachable!());
                 };
                 Some(ptr)
@@ -375,7 +368,7 @@ impl BuddyGroups<'_> {
         }
 
         let size = size.max(Size::from_log2(MIN_BLOCK));
-        match self.groups[size.in_log2() - MIN_BLOCK].deallocate(size, ptr) {
+        match self.deallocate_exact(size, ptr) {
             None => (),
             Some(v) => {
                 self.deallocate(size.parent(), v);
@@ -400,7 +393,7 @@ impl BuddyGroups<'_> {
 
         let mut test_size = size;
         while test_size < new_size {
-            if self.groups[test_size.in_log2() - MIN_BLOCK].is_buddy_allocated(test_size, block) {
+            if self.is_buddy_allocated(test_size, block) {
                 return false;
             }
             test_size = test_size.parent()
@@ -414,7 +407,7 @@ impl BuddyGroups<'_> {
         debug_assert!(self.can_grow(size, new_size, block));
 
         while size < new_size {
-            let v = self.groups[size.in_log2() - MIN_BLOCK].deallocate(size, block);
+            let v = self.deallocate_exact(size, block);
             assert_eq!(v, Some(block));
             size = size.parent();
         }
@@ -427,14 +420,11 @@ impl BuddyGroups<'_> {
         };
 
         range = range
-            .base_align_up(mem::align_of::<BuddyGroup>())?
+            .base_align_up(1 << MIN_BLOCK)?
             .limit_align_down(1 << MIN_BLOCK)?;
 
-        // Reserve some memory for `BuddyGroup`s.
-        let levels_addr = range.base;
-        range = range.base_add(mem::size_of::<[BuddyGroup; MAX_BLOCK - MIN_BLOCK]>())?;
-        let groups: &mut [MaybeUninit<BuddyGroup>; MAX_BLOCK - MIN_BLOCK] =
-            unsafe { &mut *(levels_addr as *mut _) };
+        let mut metadata: [MaybeUninit<(&mut Bitmap, usize)>; MAX_BLOCK - MIN_BLOCK] =
+            unsafe { MaybeUninit::uninit().assume_init() };
 
         for i in MIN_BLOCK..MAX_BLOCK {
             let block_size = Size::from_log2(i);
@@ -451,16 +441,14 @@ impl BuddyGroups<'_> {
             let bitmap_u8 = unsafe { slice::from_raw_parts_mut(bitmap_addr, bitmap_len) };
             let bitmap = Bitmap::new(bitmap_u8);
 
-            groups[i - MIN_BLOCK].write(BuddyGroup {
-                free_blocks: FreeBlockList { head: None },
-                bitmap,
-                base: range_for_bitmap.base,
-            });
+            metadata[i - MIN_BLOCK].write((bitmap, range_for_bitmap.base));
         }
 
-        let groups = unsafe { mem::transmute(groups) };
+        const FREE_LIST: FreeBlockList = FreeBlockList { head: None };
+
         let mut alloc = BuddyGroups {
-            groups,
+            free_blocks: [FREE_LIST; MAX_BLOCK - MIN_BLOCK],
+            metadata: unsafe { mem::transmute(metadata) },
             catch_all: FreeBlockList { head: None },
         };
 
