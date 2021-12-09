@@ -258,6 +258,7 @@ const _: () = assert!((1 << MIN_BLOCK) >= mem::size_of::<FreeBlockNode>());
 
 #[repr(C)]
 struct BuddyGroups<'a> {
+    range: AddrRange,
     free_blocks: [FreeBlockList; MAX_BLOCK - MIN_BLOCK],
     metadata: [(&'a mut Bitmap, usize); MAX_BLOCK - MIN_BLOCK],
     catch_all: FreeBlockList,
@@ -413,32 +414,37 @@ impl BuddyGroups<'_> {
         }
     }
 
-    fn new(memory: &mut [u8]) -> Option<Self> {
-        let mut range = AddrRange {
-            base: memory.as_ptr() as usize,
-            size: memory.len(),
-        };
+    unsafe fn add_memory(&mut self, mut memory: AddrRange) -> Option<()> {
+        memory = memory.base_align_up(1 << MIN_BLOCK)?;
+        while memory.size != 0 {
+            let size = Size::max_addr_align(memory.base).min(Size::max_size_fit(memory.size));
+            self.deallocate(size, NonNull::new_unchecked(memory.base as _));
+            memory = memory.base_add(size.in_bytes())?;
+        }
+        Some(())
+    }
 
+    unsafe fn new(mut range: AddrRange, mut memory: AddrRange) -> Option<Self> {
         range = range
             .base_align_up(1 << MIN_BLOCK)?
             .limit_align_down(1 << MIN_BLOCK)?;
 
         let mut metadata: [MaybeUninit<(&mut Bitmap, usize)>; MAX_BLOCK - MIN_BLOCK] =
-            unsafe { MaybeUninit::uninit().assume_init() };
+            MaybeUninit::uninit().assume_init();
 
         for i in MIN_BLOCK..MAX_BLOCK {
             let block_size = Size::from_log2(i);
 
             // Reserve some memory for `Bitmap`.
             let range_for_bitmap = range.align_expand(block_size.parent().in_bytes())?;
-            let bitmap_addr = range.base as *mut u8;
+            let bitmap_addr = memory.base as *mut u8;
             let bitmap_len =
                 Bitmap::size_needed(range_for_bitmap.size >> block_size.parent().in_log2());
-            range = range.base_add(bitmap_len)?;
+            memory = memory.base_add(bitmap_len)?;
 
             // Initialize bitmap
-            unsafe { ptr::write_bytes(bitmap_addr, 0, bitmap_len) };
-            let bitmap_u8 = unsafe { slice::from_raw_parts_mut(bitmap_addr, bitmap_len) };
+            ptr::write_bytes(bitmap_addr, 0, bitmap_len);
+            let bitmap_u8 = slice::from_raw_parts_mut(bitmap_addr, bitmap_len);
             let bitmap = Bitmap::new(bitmap_u8);
 
             metadata[i - MIN_BLOCK].write((bitmap, range_for_bitmap.base));
@@ -447,18 +453,13 @@ impl BuddyGroups<'_> {
         const FREE_LIST: FreeBlockList = FreeBlockList { head: None };
 
         let mut alloc = BuddyGroups {
+            range,
             free_blocks: [FREE_LIST; MAX_BLOCK - MIN_BLOCK],
-            metadata: unsafe { mem::transmute(metadata) },
+            metadata: mem::transmute(metadata),
             catch_all: FreeBlockList { head: None },
         };
 
-        range = range.base_align_up(1 << MIN_BLOCK)?;
-        while range.size != 0 {
-            let size = Size::max_addr_align(range.base).min(Size::max_size_fit(range.size));
-            unsafe { alloc.deallocate(size, NonNull::new_unchecked(range.base as _)) };
-            range = range.base_add(size.in_bytes())?;
-        }
-
+        alloc.add_memory(memory);
         Some(alloc)
     }
 }
@@ -473,9 +474,47 @@ pub enum InitError {
 
 impl<'a> BuddyAllocator<'a> {
     pub fn new(memory: &'a mut [u8]) -> Result<Self, InitError> {
+        Self::with_range(memory.as_ptr() as usize, memory.len(), memory)
+    }
+
+    /// Create a buddy allocator that can handle the given range.
+    ///
+    /// `memory` is an initial region within the given range that is free. Part of it will be used
+    /// for metadata, and the rest will be available for allocation.
+    ///
+    /// Available memory can be added further later.
+    pub fn with_range(base: usize, size: usize, memory: &'a mut [u8]) -> Result<Self, InitError> {
+        let range = AddrRange { base, size };
+        let memory = AddrRange {
+            base: memory.as_ptr() as usize,
+            size: memory.len(),
+        };
+
+        assert!(range.base <= memory.base);
+        // Prevents overflow.
+        let residual = range.size - (memory.base - range.base);
+        assert!(memory.size <= residual);
+
         Ok(BuddyAllocator(spin::Mutex::new(
-            BuddyGroups::new(memory).ok_or(InitError::MemoryTooSmall)?,
+            unsafe { BuddyGroups::new(range, memory) }.ok_or(InitError::MemoryTooSmall)?,
         )))
+    }
+
+    pub fn add_memory(&mut self, memory: &'a mut [u8]) {
+        let mut alloc = self.0.lock();
+        let memory = AddrRange {
+            base: memory.as_ptr() as usize,
+            size: memory.len(),
+        };
+
+        // Prevents overflow.
+        assert!(alloc.range.base <= memory.base);
+        let residual = alloc.range.size - (memory.base - alloc.range.base);
+        assert!(memory.size <= residual);
+
+        unsafe {
+            alloc.add_memory(memory);
+        }
     }
 }
 
