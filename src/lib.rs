@@ -464,15 +464,34 @@ impl BuddyGroups<'_> {
     }
 }
 
+/// Buddy allocator.
 pub struct BuddyAllocator<'a>(spin::Mutex<BuddyGroups<'a>>);
 
+/// Initialization failure.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub enum InitError {
     MemoryTooSmall,
 }
 
+/// Allocation failure.
+#[non_exhaustive]
+pub struct AllocError;
+
+fn nonnull_slice(ptr: NonNull<()>, size: Size) -> NonNull<[u8]> {
+    unsafe {
+        NonNull::new_unchecked(slice::from_raw_parts_mut(
+            ptr.as_ptr() as _,
+            size.in_bytes(),
+        ))
+    }
+}
+
 impl<'a> BuddyAllocator<'a> {
+    /// Create a buddy allocator given a free memory region.
+    ///
+    /// Unlike [`Self::with_range`], memory outside the supplied `memory` region cannot be added
+    /// later.
     pub fn new(memory: &'a mut [u8]) -> Result<Self, InitError> {
         Self::with_range(memory.as_ptr() as usize, memory.len(), memory)
     }
@@ -500,6 +519,7 @@ impl<'a> BuddyAllocator<'a> {
         )))
     }
 
+    /// Add free memory to the allocator.
     pub fn add_memory(&mut self, memory: &'a mut [u8]) {
         let mut alloc = self.0.lock();
         let memory = AddrRange {
@@ -516,57 +536,100 @@ impl<'a> BuddyAllocator<'a> {
             alloc.add_memory(memory);
         }
     }
+
+    /// Attempts to allocate a block of memory.
+    pub fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
+        if layout.size() == 0 {
+            return Ok(unsafe {
+                NonNull::new_unchecked(slice::from_raw_parts_mut(layout.align() as _, 0))
+            });
+        }
+        let size = Size::min_size_layout(layout);
+        let ptr = self.0.lock().allocate(size).ok_or(AllocError)?;
+        Ok(nonnull_slice(ptr, size))
+    }
+
+    /// Deallocates the memory referenced by `ptr`.
+    pub unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        let size = Size::min_size_layout(layout);
+        self.0
+            .lock()
+            .deallocate(size, NonNull::new_unchecked(ptr.as_ptr() as *mut _))
+    }
+
+    /// Attempts to extend the memory block.
+    pub unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr: NonNull<()> = ptr.cast();
+        let old_size = Size::min_size_layout(old_layout);
+        let new_size = Size::min_size_layout(new_layout);
+        if old_size == new_size {
+            return Ok(nonnull_slice(ptr, new_size));
+        }
+
+        let mut guard = self.0.lock();
+        if guard.can_grow(old_size, new_size, ptr) {
+            guard.grow(old_size, new_size, ptr);
+            Ok(nonnull_slice(ptr, new_size))
+        } else {
+            let new_ptr = guard.allocate(new_size).ok_or(AllocError)?;
+            drop(guard);
+            ptr::copy_nonoverlapping(
+                ptr.as_ptr() as *const u8,
+                new_ptr.as_ptr() as *mut u8,
+                old_layout.size(),
+            );
+            self.0.lock().deallocate(old_size, ptr);
+            Ok(nonnull_slice(new_ptr, new_size))
+        }
+    }
+
+    /// Attempts to shrink the memory block.
+    pub unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, AllocError> {
+        let ptr: NonNull<()> = ptr.cast();
+        let old_size = Size::min_size_layout(old_layout);
+        let new_size = Size::min_size_layout(new_layout);
+        if old_size == new_size {
+            return Ok(nonnull_slice(ptr, new_size));
+        }
+
+        self.0.lock().shrink(old_size, new_size, ptr);
+        Ok(nonnull_slice(ptr, new_size))
+    }
 }
 
 unsafe impl core::alloc::GlobalAlloc for BuddyAllocator<'_> {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if layout.size() == 0 {
-            return layout.align() as _;
-        }
-        let size = Size::min_size_layout(layout);
-        match self.0.lock().allocate(size) {
-            None => ptr::null_mut(),
-            Some(v) => v.as_ptr() as _,
+        match self.allocate(layout) {
+            Ok(slice) => (*slice.as_ptr()).as_mut_ptr(),
+            Err(_) => core::ptr::null_mut(),
         }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        let size = Size::min_size_layout(layout);
-        self.0
-            .lock()
-            .deallocate(size, NonNull::new_unchecked(ptr as *mut _))
+        self.deallocate(NonNull::new_unchecked(ptr), layout);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_layout = Layout::from_size_align_unchecked(new_size, layout.align());
-        let size = Size::min_size_layout(layout);
-        let new_size = Size::min_size_layout(new_layout);
-        if size == new_size {
-            ptr
-        } else if size > new_size {
-            self.0
-                .lock()
-                .shrink(size, new_size, NonNull::new_unchecked(ptr as *mut _));
-            ptr
+        let slice = if layout.size() >= new_size {
+            self.shrink(NonNull::new_unchecked(ptr), layout, new_layout)
         } else {
-            let mut guard = self.0.lock();
-            if guard.can_grow(size, new_size, NonNull::new_unchecked(ptr as *mut _)) {
-                guard.grow(size, new_size, NonNull::new_unchecked(ptr as *mut _));
-                ptr
-            } else {
-                let new_ptr = match guard.allocate(new_size) {
-                    None => return ptr::null_mut(),
-                    Some(v) => v,
-                }
-                .as_ptr() as *mut u8;
-                drop(guard);
-                ptr::copy_nonoverlapping(ptr, new_ptr, layout.size());
-                self.0
-                    .lock()
-                    .deallocate(size, NonNull::new_unchecked(ptr as *mut _));
-                new_ptr
-            }
+            self.grow(NonNull::new_unchecked(ptr), layout, new_layout)
+        };
+        match slice {
+            Ok(slice) => (*slice.as_ptr()).as_mut_ptr(),
+            Err(_) => core::ptr::null_mut(),
         }
     }
 }
